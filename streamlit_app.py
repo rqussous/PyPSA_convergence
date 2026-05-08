@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import hashlib
+import importlib
+import platform
 import tempfile
 import zipfile
 from contextlib import redirect_stdout
@@ -12,12 +14,16 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-import network as net_diag
-
 try:
     import plotly.graph_objects as go
 except Exception:  # pragma: no cover - optional dependency in runtime
     go = None
+
+
+@st.cache_resource(show_spinner=False)
+def _get_network_module():
+    # Delay importing network.py (and pypsa) until diagnostics are actually needed.
+    return importlib.import_module("network")
 
 
 def _run_with_captured_output(func, *args, **kwargs) -> str:
@@ -55,6 +61,7 @@ def _init_state() -> None:
         "q_df": None,
         "run_summary_path": None,
         "recent_csv_folders": [],
+        "network_load_error": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -156,13 +163,20 @@ def _render_folder_picker(default_network_folder: Path) -> str:
     st.session_state["recent_csv_folders"] = recent[:8]
 
     selected_recent = st.sidebar.selectbox("Recent folders", options=st.session_state["recent_csv_folders"])
+    can_browse_local_folder = platform.system() in {"Windows", "Darwin"}
     col_a, col_b, col_c = st.sidebar.columns(3)
     with col_a:
         if st.button("Use recent", use_container_width=True):
             st.session_state["csv_folder_input"] = selected_recent
             st.rerun()
     with col_b:
-        if st.button("Browse", use_container_width=True):
+        browse_clicked = st.button(
+            "Browse",
+            use_container_width=True,
+            disabled=not can_browse_local_folder,
+            help="Native folder picker is available for local Windows/macOS runs.",
+        )
+        if browse_clicked and can_browse_local_folder:
             selected = _pick_directory_with_tkinter(st.session_state.get("csv_folder_input", default_value))
             if selected:
                 st.session_state["csv_folder_input"] = selected
@@ -175,6 +189,9 @@ def _render_folder_picker(default_network_folder: Path) -> str:
             st.session_state["csv_folder_input"] = default_value
             _update_recent_folders(default_value)
             st.rerun()
+
+    if not can_browse_local_folder:
+        st.sidebar.caption("Browse is disabled in cloud/Linux deployments. Use upload, recent, or manual path.")
 
     return st.sidebar.text_input(
         "Network CSV folder",
@@ -233,6 +250,18 @@ def _sidebar_controls(default_network_folder: Path) -> dict:
     q_tol = st.sidebar.number_input("Q limit tol [pu]", min_value=0.001, max_value=0.20, value=0.05, step=0.005, format="%.3f",
         help="Proximity band for classifying a generator as 'at Q limit'.")
 
+    st.sidebar.header("Network loading")
+    auto_load = st.sidebar.checkbox(
+        "Auto-load selected network",
+        value=False,
+        help="If enabled, the app loads the selected network automatically when the path changes.",
+    )
+    col_load, col_reload = st.sidebar.columns(2)
+    with col_load:
+        load_now = st.button("Load", type="primary", use_container_width=True)
+    with col_reload:
+        reload_now = st.button("Reload", use_container_width=True)
+
     return {
         "csv_folder": csv_folder,
         "n_snapshots": int(n_snapshots),
@@ -250,6 +279,9 @@ def _sidebar_controls(default_network_folder: Path) -> dict:
         "s_max_fail": float(s_max_fail),
         "balance_tol": float(balance_tol),
         "q_tol": float(q_tol),
+        "auto_load": bool(auto_load),
+        "load_now": bool(load_now),
+        "reload_now": bool(reload_now),
     }
 
 
@@ -263,8 +295,13 @@ def _get_work_paths(base_dir: Path) -> dict:
     }
 
 
-def _load_network_once(csv_folder: Path):
+def _load_network_once(csv_folder: Path, force_reload: bool = False):
+    if force_reload:
+        st.session_state.pop("loaded_network", None)
+        st.session_state.pop("loaded_folder", None)
+
     if "loaded_network" not in st.session_state or st.session_state.get("loaded_folder") != str(csv_folder):
+        net_diag = _get_network_module()
         st.session_state["loaded_network"] = net_diag.load_network(csv_folder)
         st.session_state["loaded_folder"] = str(csv_folder)
     return st.session_state["loaded_network"]
@@ -280,6 +317,7 @@ def _show_console_output(title: str, output: str) -> None:
 
 
 def _run_core_checks(network_obj, snapshots) -> str:
+    net_diag = _get_network_module()
     output_parts = [_run_with_captured_output(net_diag.run_consistency_check, network_obj)]
     output_parts.append(_run_with_captured_output(net_diag.run_data_sanity_checks, network_obj))
     output_parts.append(_run_with_captured_output(net_diag.run_lpf_angle_check, network_obj, snapshots))
@@ -290,6 +328,7 @@ def _run_core_checks(network_obj, snapshots) -> str:
 
 
 def _run_localization(network_obj, snapshots, z_threshold: float, localization_csv: Path) -> tuple[str, pd.DataFrame | None]:
+    net_diag = _get_network_module()
     output = _run_with_captured_output(
         net_diag.run_network_localization,
         network_obj,
@@ -305,6 +344,7 @@ def _run_localization(network_obj, snapshots, z_threshold: float, localization_c
 
 
 def _run_ramp_test(network_obj, snapshots, settings: dict, ramp_csv: Path) -> tuple[str, pd.DataFrame | None]:
+    net_diag = _get_network_module()
     output = _run_with_captured_output(
         net_diag.run_pf_ramp_test,
         network_obj,
@@ -322,6 +362,7 @@ def _run_ramp_test(network_obj, snapshots, settings: dict, ramp_csv: Path) -> tu
 
 
 def _run_optimize(network_obj, snapshots, solver: str) -> str:
+    net_diag = _get_network_module()
     output = _run_with_captured_output(net_diag.run_optimize_smoke_test, network_obj, snapshots, solver)
     return output
 
@@ -329,6 +370,7 @@ def _run_optimize(network_obj, snapshots, solver: str) -> str:
 def _run_physical(
     network_obj, snapshots, settings: dict, diagnostics_dir: Path,
 ) -> tuple[str, dict[str, pd.DataFrame | None]]:
+    net_diag = _get_network_module()
     output, results = _run_and_capture(
         net_diag.run_physical_checks,
         network_obj,
@@ -1259,10 +1301,25 @@ def main() -> None:
 
     _update_recent_folders(str(csv_folder))
 
-    try:
-        network_obj = _load_network_once(csv_folder)
-    except Exception as exc:
-        st.error(f"Failed to load network: {exc}")
+    current_loaded_folder = st.session_state.get("loaded_folder")
+    needs_load = current_loaded_folder != str(csv_folder) or "loaded_network" not in st.session_state
+    should_reload = bool(settings.get("reload_now", False))
+    should_load = bool(settings.get("load_now", False)) or should_reload or (bool(settings.get("auto_load", False)) and needs_load)
+
+    if should_load:
+        try:
+            with st.spinner("Loading network data..."):
+                _load_network_once(csv_folder, force_reload=should_reload)
+            st.session_state["network_load_error"] = ""
+            st.success("Network loaded successfully.")
+        except Exception as exc:
+            st.session_state["network_load_error"] = str(exc)
+
+    network_obj = st.session_state.get("loaded_network")
+    if network_obj is None or st.session_state.get("loaded_folder") != str(csv_folder):
+        if st.session_state.get("network_load_error"):
+            st.error(f"Failed to load network: {st.session_state['network_load_error']}")
+        st.info("Select a network path and click Load in the sidebar to start analysis.")
         st.stop()
 
     snapshots = network_obj.snapshots[: max(0, settings["n_snapshots"])]

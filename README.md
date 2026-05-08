@@ -24,6 +24,13 @@ python -m streamlit run streamlit_app.py
 
 If you are using a dedicated Conda environment, activate it first and then launch the same command.
 
+## Streamlit Community Cloud deployment
+
+- Set Python to `3.11` in the app's Advanced settings when deploying.
+- Keep dependencies in `requirements.txt` at the repository root.
+- The app now lazy-loads network data: choose a folder and click **Load** in the sidebar before running checks.
+- In cloud/Linux deployments, the native **Browse** folder picker is disabled; use zip upload or a manual path.
+
 ## Repository scope
 
 This repository intentionally excludes processed network data and generated diagnostics artifacts from version control.
