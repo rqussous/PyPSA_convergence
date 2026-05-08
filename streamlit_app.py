@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import io
+import hashlib
+import tempfile
+import zipfile
 from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any
@@ -63,6 +66,35 @@ def _load_csv_preview(csv_path: str) -> pd.DataFrame:
     return pd.read_csv(csv_path)
 
 
+def _find_network_root(search_dir: Path) -> Path | None:
+    direct_candidate = search_dir / "network.csv"
+    if direct_candidate.exists():
+        return search_dir
+
+    candidates = sorted(search_dir.rglob("network.csv"), key=lambda path: len(path.parts))
+    if not candidates:
+        return None
+    return candidates[0].parent
+
+
+def _extract_uploaded_network_zip(uploaded_file) -> Path:
+    payload = uploaded_file.getvalue()
+    digest = hashlib.sha256(payload).hexdigest()[:12]
+    extract_dir = Path(tempfile.gettempdir()) / "pypsa_convergence_uploads" / digest
+    marker_path = extract_dir / ".complete"
+
+    if not marker_path.exists():
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            archive.extractall(extract_dir)
+        marker_path.write_text("ok", encoding="utf-8")
+
+    network_root = _find_network_root(extract_dir)
+    if network_root is None:
+        raise ValueError("Uploaded zip does not contain a network.csv file.")
+    return network_root
+
+
 def _pick_directory_with_tkinter(initial_dir: str) -> str | None:
     try:
         import tkinter as tk
@@ -89,6 +121,27 @@ def _update_recent_folders(folder: str, max_items: int = 8) -> None:
 
 def _render_folder_picker(default_network_folder: Path) -> str:
     st.sidebar.subheader("Network folder picker")
+
+    if not default_network_folder.exists():
+        st.sidebar.info(
+            "Bundled network data is not available in this deployment. "
+            "Upload a zipped CSV folder or enter a server path manually."
+        )
+
+    uploaded_network = st.sidebar.file_uploader(
+        "Upload zipped network CSV folder",
+        type=["zip"],
+        help="Upload a zip containing your exported PyPSA CSV network folder, including network.csv.",
+    )
+
+    if uploaded_network is not None:
+        try:
+            extracted_path = _extract_uploaded_network_zip(uploaded_network)
+            st.sidebar.success(f"Using uploaded network: {extracted_path.name}")
+            st.session_state["csv_folder_input"] = str(extracted_path)
+            _update_recent_folders(str(extracted_path))
+        except Exception as exc:
+            st.sidebar.error(f"Upload could not be read: {exc}")
 
     default_value = str(default_network_folder)
     if "csv_folder_input" not in st.session_state:
@@ -1198,7 +1251,10 @@ def main() -> None:
 
     csv_folder = Path(settings["csv_folder"]).expanduser()
     if not csv_folder.exists():
-        st.error(f"Network folder not found: {csv_folder}")
+        st.error(
+            f"Network folder not found: {csv_folder}. "
+            "For Streamlit deployment, upload a zipped CSV folder from the sidebar or configure an accessible path."
+        )
         st.stop()
 
     _update_recent_folders(str(csv_folder))
